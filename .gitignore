@@ -1,0 +1,11 @@
+.venv
+.env
+__pycache__/
+*.py[cod]
+*.log
+data/
+.idea/
+.pytest_cache/
+
+# Отчёты Data Quality генерируются при каждом прогоне DAG и в репозиторий не входят.
+dq_reports/*.html
