@@ -1,0 +1,5 @@
+# Оболочка и python внутри контейнеров Linux: CRLF ломает shebang entrypoint.sh
+# при клонировании на Windows с core.autocrlf=true.
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf

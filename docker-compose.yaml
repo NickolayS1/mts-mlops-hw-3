@@ -1,0 +1,244 @@
+name: mts-mlops-hw3
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    networks: [ml-scorer]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    networks: [ml-scorer]
+    depends_on: [zookeeper]
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Топики создаёт kafka-setup, автосоздание выключено: иначе scoring_writer
+      # может подписаться на топик раньше, чем он получит нужные партиции.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9095", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    networks: [ml-scorer]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      while ! kafka-topics --bootstrap-server kafka:9092 --list >/dev/null 2>&1; do sleep 1; done
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scores --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:9092 --list
+      "
+
+  kafka-ui:
+    # Тег зафиксирован как в ДЗ №1: плавающий latest делает проверку невоспроизводимой.
+    image: provectuslabs/kafka-ui:v0.7.2
+    networks: [ml-scorer]
+    depends_on: [kafka]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+  postgres:
+    image: postgres:15
+    networks: [ml-scorer]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+
+  data_loader:
+    build: ./data_loader
+    networks: [ml-scorer]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TRAIN_DATA_CSV: /data/train.csv
+      TRAINING_DATA_DIR: /training_data
+      MODELS_DIR: /models
+      BOOTSTRAP_DIR: /bootstrap_models
+    volumes:
+      - ./pipeline:/pipeline:ro
+      - ${TRAIN_DATA_CSV}:/data/train.csv:ro
+      - training_data:/training_data
+      - model_registry:/models
+      # Стартовая версия для сервиса скоринга: у него свой том моделей.
+      - bootstrap_models:/bootstrap_models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  fraud_detector:
+    build: ./fraud_detector
+    networks: [ml-scorer]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      KAFKA_SCORING_TOPIC: scores
+      MODELS_DIR: /models
+      BOOTSTRAP_DIR: /app/models
+    volumes:
+      # монтируется пакет целиком, потому что
+      # features.py импортируется как pipeline.features.
+      - ./pipeline:/app/pipeline:ro
+      - model_registry:/models
+      # Начальная версия от data_loader: нужна, пока DAG ничего не публиковал.
+      - bootstrap_models:/app/models
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  transaction_simulator:
+    build: ./transaction_simulator
+    networks: [ml-scorer]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      TRAIN_DATA_CSV: /data/train.csv
+      SEND_INTERVAL_SECONDS: "0.5"
+    volumes:
+      - ${TRAIN_DATA_CSV}:/data/train.csv:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scoring_writer:
+    build: ./scoring_writer
+    networks: [ml-scorer]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_SCORING_TOPIC: scores
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow:
+    build: ./airflow
+    # Контейнер стартует от root: официальный entrypoint не понижает права,
+    # а каталоги моделей и данных общие с сервисами, которые работают от root.
+    user: "0:0"
+    networks: [ml-scorer]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+      # Метабаза Airflow — отдельная база в том же контейнере Postgres.
+      # Airflow не пишет в fraud_db, а витрина не зависит от его состояния.
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+      PYTHONPATH: /opt/airflow
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TRAINING_DATA_DIR: /opt/airflow/training_data
+      MODELS_DIR: /opt/airflow/models
+      DQ_REPORTS_DIR: /opt/airflow/dq_reports
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - ./pipeline:/opt/airflow/pipeline:ro
+      - training_data:/opt/airflow/training_data
+      - model_registry:/opt/airflow/models
+      # Bind-mount, а не том: отчёт должен открываться прямо из репозитория.
+      - ./dq_reports:/opt/airflow/dq_reports
+      - airflow_state:/opt/airflow/airflow_state
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      data_loader:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_completed_successfully
+    # Переживает перезапуск демона Docker, как и остальные долгоживущие сервисы.
+    restart: unless-stopped
+
+  # Создаёт базу метаданных Airflow в контейнере Postgres: сервис airflow
+  # стартует после успешного выполнения.
+  airflow-db:
+    image: postgres:15
+    networks: [ml-scorer]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      until pg_isready -h postgres -U ${POSTGRES_USER}; do sleep 1; done
+      if psql -h postgres -U ${POSTGRES_USER} -d ${POSTGRES_DB} -tAc \"SELECT 1 FROM pg_database WHERE datname = 'airflow'\" | grep -q 1; then
+        echo 'база метаданных Airflow уже существует'
+      else
+        createdb -h postgres -U ${POSTGRES_USER} airflow && echo 'создана база метаданных Airflow'
+      fi
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+networks:
+  ml-scorer:
+    name: ml-scorer
+    driver: bridge
+
+volumes:
+  postgres_data:
+  training_data:
+  model_registry:
+  bootstrap_models:
+  airflow_state:
