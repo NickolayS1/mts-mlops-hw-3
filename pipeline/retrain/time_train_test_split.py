@@ -15,6 +15,7 @@ def time_train_test_split(window_info: dict) -> dict:
     Читает parquet окна из window_info и пишет сырые части в splits/. Случайный
     split не используется: месяцы идут по порядку, поэтому проверка честно
     оценивает модель на будущем относительно обучения месяце.
+    Повтор задачи перезаписывает те же train_raw.parquet и test_raw.parquet.
     Возвращает пути к частям и подписи месяцев.
     """
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
